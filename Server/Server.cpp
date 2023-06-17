@@ -20,6 +20,8 @@ using SOCKET_INFO = struct socketInfo {
     HANDLE hEventHandle = nullptr;
     char strNickName[50];
     char strAddress[50];
+    OVERLAPPED overlapped;
+    WSABUF wsabuf;
 };
 
 std::vector<SOCKET_INFO> pClientList;
@@ -29,14 +31,16 @@ int InitAddressInfo(WSADATA* pWSADataOut, ADDR_INFO** ppAddressOut);
 void SetupListenSocket(ADDR_INFO* pAddressInfo, SOCKET* ppOut);
 void AcceptClientSocket(SOCKET pListenSocket, SOCKET* ppOut);
 void RunServer(SOCKET pListenSocket);
-void ServerThread(SOCKET pListenSocket);
+void EventServerThread(SOCKET pListenSocket);
 void RunServerCommand();
 void ShutdownServer(SOCKET pListenSocket);
 void JoinClient(SOCKET pListenSocket);
 void ReceiveClient(int iIndex);
 void ExitClient(int iIndex);
 void ReceiveThread(int iIndex);
-HANDLE IOCPReady();
+void EventServerReady(SOCKET pListenSocket);
+HANDLE IOCPReady(SOCKET pListenSocket);
+void IOCPServerThread(SOCKET pListenSocket, HANDLE* hNewCompletingPort);
 void IOThread(HANDLE hCompletingPort);
 
 int main() {
@@ -62,20 +66,6 @@ int main() {
     }
 
     freeaddrinfo(pAddrInfo);
-
-    /*
-    SOCKET pClientSocket = INVALID_SOCKET;
-    try {
-        AcceptClientSocket(pListenSocket, &pClientSocket);
-    }
-    catch (int iException) {
-        closesocket(pListenSocket);
-        WSACleanup();
-
-        return 1;
-    }*/
-
-    //IOCPReady();
 
     try {
         RunServer(pListenSocket);
@@ -157,55 +147,14 @@ void AcceptClientSocket(SOCKET pListenSocket, SOCKET* ppOut) {
 }
 
 void RunServer(SOCKET pListenSocket) {
-    pClientList.reserve(MAX_CLIENT);
+    //EventServerReady(pListenSocket);
 
-    for (int i = 0; i < MAX_CLIENT; ++i) {
-        SOCKET_INFO newClient;
-        ZeroMemory(&newClient, sizeof(newClient));
-
-        pClientList.push_back(newClient);
-    }
-
-    std::thread serverThread = std::thread(ServerThread, pListenSocket);
-    serverThread.detach();
+    IOCPReady(pListenSocket);
 
     std::cout << "~ run server ~\n";
-
-    //int iSendResult;
-    //char recvbuf[DEFAULT_BUFLEN];
-    //int recvbuflen = DEFAULT_BUFLEN;
-    //int iResult;
-
-    //// Receive until the peer shuts down the connection
-    //do {
-    //    iResult = recv(pClientSocket, recvbuf, recvbuflen, 0);
-    //    if (iResult > 0) {
-    //        std::cout << "Bytes received: " << iResult << "\n";
-
-    //        // Echo the buffer back to the sender
-    //        iSendResult = send(pClientSocket, recvbuf, iResult, 0);
-    //        if (iSendResult == SOCKET_ERROR) {
-    //            std::cout << "send failed with error: " << WSAGetLastError() << "\n";
-    //            throw 1;
-    //        }
-    //        std::cout << "Bytes sent: " << iSendResult << "\n";
-    //    }
-    //    else if (iResult == 0)
-    //        std::cout << "Connection closing...\n";
-    //    else {
-    //        std::cout << "recv failed with error: " << WSAGetLastError() << "\n";
-    //        throw 1;
-    //    }
-    //} while (iResult > 0);
-
-    //iResult = shutdown(pClientSocket, SD_SEND);
-    //if (iResult == SOCKET_ERROR) {
-    //    std::cout << "shutdown failed: " << WSAGetLastError() << "\n";
-    //    throw 1;
-    //}
 }
 
-void ServerThread(SOCKET pListenSocket) {
+void EventServerThread(SOCKET pListenSocket) {
     WSAEVENT handles[MAX_CLIENT + 1];
     int iIndex = 0;
     WSANETWORKEVENTS runEvent;
@@ -305,7 +254,21 @@ void ReceiveThread(int iIndex) {
     };
 }
 
-HANDLE IOCPReady() {
+void EventServerReady(SOCKET pListenSocket) {
+    pClientList.reserve(MAX_CLIENT);
+
+    for (int i = 0; i < MAX_CLIENT; ++i) {
+        SOCKET_INFO newClient;
+        ZeroMemory(&newClient, sizeof(newClient));
+
+        pClientList.push_back(newClient);
+    }
+
+    std::thread serverThread = std::thread(EventServerThread, pListenSocket);
+    serverThread.detach();
+}
+
+HANDLE IOCPReady(SOCKET pListenSocket) {
     SYSTEM_INFO systemInfo;
     HANDLE hNewCompletingPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     GetSystemInfo(&systemInfo);
@@ -314,18 +277,66 @@ HANDLE IOCPReady() {
         newIOThread.detach();
     }
 
+    std::thread serverThread = std::thread(IOCPServerThread, pListenSocket, &hNewCompletingPort);
+    serverThread.detach();
+
     return hNewCompletingPort;
 }
 
-void IOThread(HANDLE hCompletingPort) {
-    /*
-    SOCKET sock;
-    DWORD byteTrans;
-    LPPER_HANDLE_DATA handleInfo;
-    LPPER_IO_DATA ioInfo;
+void IOCPServerThread(SOCKET pListenSocket, HANDLE* hNewCompletingPort) {
+    SOCKADDR_IN joinAddress;
+
+    DWORD dwFlags;
+    DWORD dwReceiveBytes;
+    int iAddressLength;
 
     while (true) {
-        GetQueuedCompletionStatus(hCompletingPort, &byteTrans, (LPDWORD)&handleInfo, (LPOVERLAPPED*)&ioInfo, INFINITE);
-        sock = handleInfo->hClntSocket;
-    }*/
+        int iAddressLength = sizeof(joinAddress);
+        pClientList[iClientCount].pSocket = accept(pListenSocket, (SOCKADDR*)&joinAddress, &iAddressLength);
+
+        std::cout << "立加\n";
+
+        // 家南 IOCP殿废
+        if ((*hNewCompletingPort = CreateIoCompletionPort((HANDLE)pClientList[iClientCount].pSocket, *hNewCompletingPort, pClientList[iClientCount].pSocket, 0)) == NULL) {
+            std::cout << "CreateIoCompletionPort Error" << "\n";
+            return;
+        }
+
+        dwFlags = 0;
+        dwReceiveBytes = MAXBYTE;
+
+        if (WSARecv(pClientList[iClientCount].pSocket, &pClientList[iClientCount].wsabuf, 1, &dwReceiveBytes, &dwFlags, &pClientList[iClientCount].overlapped, NULL) == SOCKET_ERROR) {
+            if (WSAGetLastError() == ERROR_IO_PENDING) {
+                std::cout << "WSARecv Success" << "\n";
+            }
+            else {
+                std::cout << "WRSRecv Error" << pClientList[iClientCount].pSocket << WSAGetLastError() << "\n";
+                return;
+            }
+        }
+
+        ++iClientCount;
+    }
+}
+
+void IOThread(HANDLE hCompletingPort) {
+    DWORD flags = 0;
+    SOCKET_INFO* socketInfo;
+    DWORD dwNumBytes;
+    ULONG_PTR completionKey;
+    LPOVERLAPPED pOverlapped;
+
+    while (true) {
+        GetQueuedCompletionStatus(hCompletingPort, &dwNumBytes, &completionKey, &pOverlapped, INFINITE);
+        socketInfo = (SOCKET_INFO*)pOverlapped;
+        if (dwNumBytes == 0) {
+            closesocket(socketInfo->pSocket);
+            //free(sInfo);
+            continue;
+        }
+
+        memset(&(socketInfo->overlapped), 0x00, sizeof(OVERLAPPED));
+        send(socketInfo->pSocket, socketInfo->wsabuf.buf, socketInfo->wsabuf.len, 0);
+        WSARecv(socketInfo->pSocket, &socketInfo->wsabuf, 1, &dwNumBytes, &flags, &socketInfo->overlapped, NULL);
+    }
 }
